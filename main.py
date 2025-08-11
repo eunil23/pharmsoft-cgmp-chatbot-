@@ -2,10 +2,8 @@ import streamlit as st
 from langchain_core.messages.chat import ChatMessage
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings
-from langchain_chroma import Chroma
+from langchain_community.vectorstores import FAISS  # ChromaDB 대신 FAISS 사용
 from langchain_anthropic import ChatAnthropic
-from langchain import hub
-from langchain.chains import RetrievalQAWithSourcesChain
 from langchain_core.prompts import PromptTemplate
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -15,7 +13,9 @@ import os
 import hashlib
 import fitz  # PyMuPDF
 import pandas as pd
-from io import StringIO
+import pickle
+import base64
+from io import BytesIO
 
 # 환경변수 설정 및 API 키 관리
 def load_config():
@@ -100,38 +100,114 @@ if "messages" not in st.session_state:
     # 대화기록을 저장하기 위한 용도로 생성한다.
     st.session_state["messages"] = []
 
-# 데이터베이스 초기화를 세션 상태로 관리
+# FAISS 관련 함수들
 @st.cache_resource
-def initialize_database():
-    """데이터베이스를 초기화하는 함수 (캐시된 리소스로 관리)"""
+def initialize_embeddings():
+    """임베딩 모델 초기화 (캐시됨)"""
     try:
-        # OpenAI에서 제공하는 Embedding Model을 활용해서 `chunk`를 vector화
-        embedding = OpenAIEmbeddings(
+        return OpenAIEmbeddings(
             model="text-embedding-3-large",
-            openai_api_key=APP_CONFIG['openai_key']  # API 키 명시적 전달
+            openai_api_key=APP_CONFIG['openai_key']
         )
-        
-        # 배포 환경을 고려한 저장 디렉토리 설정
-        if os.path.exists("./chroma"):
-            persist_directory = "./chroma"
-        else:
-            # 배포환경용 - 임시 디렉토리 사용
-            persist_directory = tempfile.mkdtemp(prefix="chroma_")
-            st.info(f"임시 저장소 사용: {persist_directory}")
-        
-        # 데이터를 저장할 때 
-        database = Chroma(
-            collection_name="chroma-cGMP",
-            persist_directory=persist_directory,
-            embedding_function=embedding,
-        )
-        return database
     except Exception as e:
-        st.error(f"데이터베이스 초기화 실패: {str(e)}")
+        st.error(f"임베딩 모델 초기화 실패: {str(e)}")
         return None
 
+def save_vectorstore_to_session(vectorstore):
+    """FAISS 벡터 저장소를 세션 상태에 저장"""
+    try:
+        # FAISS 인덱스를 바이트로 직렬화
+        buffer = BytesIO()
+        
+        # 문서와 인덱스를 따로 저장
+        faiss_data = {
+            'docstore': dict(vectorstore.docstore._dict),
+            'index_to_docstore_id': vectorstore.index_to_docstore_id,
+        }
+        
+        # 인덱스를 바이트로 변환
+        import faiss
+        faiss.write_index(vectorstore.index, "temp_index.faiss")
+        with open("temp_index.faiss", "rb") as f:
+            index_bytes = f.read()
+        os.remove("temp_index.faiss")
+        
+        faiss_data['index_bytes'] = base64.b64encode(index_bytes).decode()
+        
+        # 세션 상태에 저장
+        st.session_state["vectorstore_data"] = base64.b64encode(
+            pickle.dumps(faiss_data)
+        ).decode()
+        
+        return True
+    except Exception as e:
+        st.warning(f"벡터 저장소 저장 중 오류: {e}")
+        return False
+
+def load_vectorstore_from_session(embedding):
+    """세션 상태에서 FAISS 벡터 저장소 복원"""
+    try:
+        if "vectorstore_data" not in st.session_state:
+            return None
+            
+        # 데이터 복원
+        data = pickle.loads(
+            base64.b64decode(st.session_state["vectorstore_data"])
+        )
+        
+        # 인덱스 파일 복원
+        index_bytes = base64.b64decode(data['index_bytes'])
+        with open("temp_restore.faiss", "wb") as f:
+            f.write(index_bytes)
+        
+        # FAISS 인덱스 로드
+        import faiss
+        index = faiss.read_index("temp_restore.faiss")
+        os.remove("temp_restore.faiss")
+        
+        # FAISS 벡터 저장소 재구성
+        from langchain_community.docstore.in_memory import InMemoryDocstore
+        from langchain_core.documents import Document
+        
+        # 문서 저장소 복원
+        docstore = InMemoryDocstore()
+        for doc_id, doc_data in data['docstore'].items():
+            docstore._dict[doc_id] = Document(
+                page_content=doc_data['page_content'],
+                metadata=doc_data['metadata']
+            )
+        
+        # FAISS 객체 재구성
+        vectorstore = FAISS(
+            embedding_function=embedding,
+            index=index,
+            docstore=docstore,
+            index_to_docstore_id=data['index_to_docstore_id']
+        )
+        
+        return vectorstore
+        
+    except Exception as e:
+        st.warning(f"벡터 저장소 복원 중 오류: {e}")
+        return None
+
+def initialize_database():
+    """FAISS 벡터 저장소 초기화"""
+    embedding = initialize_embeddings()
+    if not embedding:
+        return None
+    
+    # 세션에서 기존 벡터 저장소 복원 시도
+    vectorstore = load_vectorstore_from_session(embedding)
+    if vectorstore:
+        st.info("✅ 기존 벡터 저장소를 복원했습니다.")
+        return vectorstore
+    
+    # 새로운 벡터 저장소는 None으로 시작 (문서 추가 시 생성)
+    return None
+
 # 데이터베이스 초기화
-if "database" not in st.session_state or st.session_state["database"] is None:
+if "database" not in st.session_state:
     st.session_state["database"] = initialize_database()
 
 # 사이드바 생성
@@ -152,6 +228,8 @@ with st.sidebar:
             
         if APP_CONFIG['langsmith_key']:
             st.info(f"📊 LangSmith 프로젝트: {APP_CONFIG['langsmith_project']}")
+            
+        st.info("🚀 벡터 저장소: FAISS (메모리 기반)")
     
     # 저장된 문서 목록 표시
     if "processed_files" not in st.session_state:
@@ -166,22 +244,17 @@ with st.sidebar:
         if st.button("🔍 DB 상태 확인"):
             try:
                 if st.session_state["database"]:
-                    total_docs = st.session_state["database"].get()
-                    st.info(f"총 저장된 청크: {len(total_docs['documents'])}개")
+                    # FAISS에서 문서 수 확인
+                    total_docs = st.session_state["database"].index.ntotal
+                    st.info(f"총 저장된 벡터: {total_docs}개")
                     
-                    # 파일별 청크 수 표시
-                    file_counts = {}
-                    for metadata in total_docs['metadatas']:
-                        if metadata and 'source' in metadata:
-                            filename = metadata['source']
-                            file_counts[filename] = file_counts.get(filename, 0) + 1
-                    
-                    st.write("📊 파일별 청크 수:")
-                    for filename, count in file_counts.items():
-                        st.write(f"  • {filename}: {count}개")
+                    # 문서별 정보 표시
+                    st.write("📊 저장된 파일:")
+                    for filename in st.session_state["processed_files"]:
+                        st.write(f"  • {filename}")
                         
                 else:
-                    st.error("데이터베이스가 초기화되지 않았습니다.")
+                    st.warning("벡터 저장소가 초기화되지 않았습니다.")
                     
             except Exception as e:
                 st.error(f"DB 상태 확인 실패: {str(e)}")
@@ -196,33 +269,27 @@ with st.sidebar:
     # 데이터베이스 초기화 버튼
     if st.button("🗑️ 전체 데이터베이스 초기화", type="secondary"):
         try:
-            # 방법 1: 세션 상태에서 데이터베이스 제거
+            # 세션 상태에서 벡터 저장소 제거
             if "database" in st.session_state:
                 del st.session_state["database"]
             
-            # 방법 2: 캐시된 리소스 클리어
-            initialize_database.clear()
+            # 저장된 벡터 데이터 제거
+            if "vectorstore_data" in st.session_state:
+                del st.session_state["vectorstore_data"]
             
-            # 방법 3: 물리적 파일 삭제 (로컬 환경인 경우)
-            import shutil
-            if os.path.exists("./chroma"):
-                shutil.rmtree("./chroma")
+            # 캐시 클리어
+            initialize_embeddings.clear()
             
             # 처리된 파일 목록 초기화
             st.session_state["processed_files"] = set()
             st.session_state["messages"] = []
+            st.session_state["database"] = None
             
             st.success("데이터베이스가 완전히 초기화되었습니다.")
-            st.info("페이지를 새로고침하거나 새 문서를 업로드해주세요.")
+            st.info("새 문서를 업로드해주세요.")
             
         except Exception as e:
             st.error(f"데이터베이스 초기화 중 오류 발생: {str(e)}")
-            # 오류가 발생해도 세션 상태는 초기화
-            if "database" in st.session_state:
-                del st.session_state["database"]
-            st.session_state["processed_files"] = set()
-            st.session_state["messages"] = []
-            st.info("세션 상태는 초기화되었습니다. 페이지를 새로고침해주세요.")
 
 def get_file_hash(file_content):
     """파일 내용의 해시값을 생성합니다."""
@@ -230,24 +297,8 @@ def get_file_hash(file_content):
 
 def is_file_already_processed(filename, file_hash):
     """파일이 이미 처리되었는지 확인합니다."""
-    try:
-        if not st.session_state.get("database"):
-            return False
-            
-        # 데이터베이스에서 해당 파일의 문서들을 검색
-        existing_docs = st.session_state["database"].get(
-            where={"source": filename}
-        )
-        
-        # 같은 파일명과 해시값을 가진 문서가 있는지 확인
-        if existing_docs['documents']:
-            for metadata in existing_docs['metadatas']:
-                if metadata and metadata.get('file_hash') == file_hash:
-                    return True
-        return False
-    except Exception as e:
-        st.warning(f"중복 확인 중 오류: {str(e)}")
-        return False
+    # FAISS는 메타데이터 검색이 제한적이므로 간단히 파일명으로만 확인
+    return filename in st.session_state.get("processed_files", set())
 
 def extract_pdf_content_advanced(file_path):
     """PyMuPDF를 사용해서 PDF에서 텍스트, 표, 구조 정보를 추출합니다."""
@@ -336,11 +387,12 @@ def extract_pdf_content_advanced(file_path):
     return documents
 
 def process_pdf_file(uploaded_file):
-    """PDF 파일을 처리하고 Chroma DB에 저장합니다."""
+    """PDF 파일을 처리하고 FAISS 벡터 저장소에 저장합니다."""
     try:
-        # 데이터베이스 확인
-        if not st.session_state.get("database"):
-            return f"❌ '{uploaded_file.name}': 데이터베이스가 초기화되지 않았습니다."
+        # 임베딩 모델 가져오기
+        embedding = initialize_embeddings()
+        if not embedding:
+            return f"❌ '{uploaded_file.name}': 임베딩 모델 초기화 실패"
         
         # 파일 내용 읽기
         file_content = uploaded_file.read()
@@ -393,8 +445,17 @@ def process_pdf_file(uploaded_file):
                     'extraction_method': extraction_method
                 }
             
-            # Chroma DB에 추가
-            st.session_state["database"].add_documents(splits)
+            # FAISS 벡터 저장소 생성/업데이트
+            if st.session_state["database"] is None:
+                # 새로운 FAISS 벡터 저장소 생성
+                st.session_state["database"] = FAISS.from_documents(splits, embedding)
+            else:
+                # 기존 벡터 저장소에 문서 추가
+                new_vectorstore = FAISS.from_documents(splits, embedding)
+                st.session_state["database"].merge_from(new_vectorstore)
+            
+            # 세션 상태에 저장
+            save_vectorstore_to_session(st.session_state["database"])
             
             # 처리된 파일 목록에 추가
             st.session_state["processed_files"].add(uploaded_file.name)
@@ -432,7 +493,7 @@ def get_ai_message(user_input):
     # 데이터베이스 확인
     if "database" not in st.session_state or st.session_state["database"] is None:
         return {
-            "answer": "데이터베이스가 초기화되지 않았습니다. 페이지를 새로고침하거나 문서를 업로드해주세요.",
+            "answer": "데이터베이스가 초기화되지 않았습니다. 문서를 업로드해주세요.",
             "sources": []
         }
     
@@ -443,15 +504,15 @@ def get_ai_message(user_input):
     )
     
     try:
-        # 검색된 문서들 가져오기 (더 많은 문서 검색)
+        # FAISS에서 유사도 검색 (retriever 방식)
         retriever = st.session_state["database"].as_retriever(
             search_type="similarity",
-            search_kwargs={"k": 5}  # 5개 문서로 증가
+            search_kwargs={"k": 5}  # 5개 문서 검색
         )
         docs = retriever.get_relevant_documents(user_input)
     except Exception as e:
         return {
-            "answer": f"문서 검색 중 오류가 발생했습니다: {str(e)}\n\n데이터베이스를 초기화하고 다시 시도해주세요.",
+            "answer": f"문서 검색 중 오류가 발생했습니다: {str(e)}\n\n문서를 다시 업로드해주세요.",
             "sources": []
         }
     
@@ -557,7 +618,7 @@ if uploaded_files and 'process_btn' in locals() and process_btn:
             else:
                 st.error(result)
         
-        # 처리 완료 메시지 (애니메이션 제거)
+        # 처리 완료 메시지
         st.info("📄 문서 처리가 완료되었습니다!")
 
 st.divider()
@@ -605,4 +666,4 @@ if user_input:
             
         except Exception as e:
             st.error(f"오류가 발생했습니다: {str(e)}")
-            st.info("API 키 설정과 Chroma 데이터베이스 상태를 확인해주세요.")
+            st.info("API 키 설정과 벡터 저장소 상태를 확인해주세요.")
